@@ -1,8 +1,9 @@
-from re import Pattern
+import json
 from typing import Any, List, Tuple, Optional, Dict
 import regex as re
 from collections import Counter, defaultdict
-
+import os
+import json
 def train_bpe(
     input_path: str, 
     vocab_size: int=10000, 
@@ -93,8 +94,58 @@ def train_bpe(
     for t in special_tokens:
         vocab[len(vocab)]  = t.encode("utf-8")   
     return vocab, merges
-        
+def get_encoder_dict():
+    """
+    创建一个从字节到 Unicode 字符的映射。
+    参考 GPT-2 官方实现，将不可见字节映射到更高位的 Unicode 区块。
+    """
+    bs = list(range(ord("!"), ord("~") + 1)) + \
+         list(range(ord("¡"), ord("¬") + 1)) + \
+         list(range(ord("®"), ord("ÿ") + 1))
+    
+    cs = bs[:] # 拷贝一份，作为对应的字符编码
+    
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}      
 
+def save_tokenizer(vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], save_dir: str):
+    """
+    保存分词器模型到指定目录。
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    byte_encoder = get_encoder_dict()
+
+    # 1. 转换并保存 vocab.json
+    # 我们的 vocab 目前是 {id: bytes}，需要转成 {string: id}
+    # 因为 JSON 的 key 必须是字符串
+    token_to_id = {}
+    for idx, b_seq in vocab.items():
+        # 将每个字节序列转为对应的 Unicode 字符串
+        # 比如 b'a\xff' -> 'a' + byte_encoder[255]
+        token_str = "".join(byte_encoder[b] for b in b_seq)
+        token_to_id[token_str] = idx
+
+    with open(os.path.join(save_dir, "vocab.json"), "w", encoding="utf-8") as f:
+        json.dump(token_to_id, f, indent=4, ensure_ascii=False)
+
+    # 2. 转换并保存 merges.txt
+    with open(os.path.join(save_dir, "merges.txt"), "w", encoding="utf-8") as f:
+        # 写入一个版本标记（可选）
+        for pair in merges:
+            # pair 是 (bytes, bytes)，也要转换成映射后的字符串
+            p0 = "".join(byte_encoder[b] for b in pair[0])
+            p1 = "".join(byte_encoder[b] for b in pair[1])
+            f.write(f"{p0} {p1}\n")
+
+    print(f"Tokenizer 已保存至: {save_dir}")
+    
 def main():
     input_path = "/home/pkuhetu/lqs/assignment1-basics/tests/fixtures/tinystories_sample_5M.txt"
     train_bpe(input_path)
