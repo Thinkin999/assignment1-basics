@@ -1,95 +1,153 @@
-from re import Pattern
-from typing import Any, List, Tuple, Optional, Dict
+from typing import Iterable, Iterator
+from .train_bpe import get_encoder_dict
 import regex as re
-from collections import Counter, defaultdict
-
-def train_bpe(
-    input_path: str, 
-    vocab_size: int, 
-    special_tokens: List[str]
-) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]
+import json
+class Tokenizer:
     """
-    Used to train a tokenizer.
-    Args:
+    建立清晰的逻辑
+    1.文本正则化切割 str -> list[str]
+    2.str-> list[bytes]
+    3.merge
+    4.list[bytes] -> vocab
 
-    Return:
-            vocab:dict[int, bytes],用来从token转换为字节 进行decode的操作
-            merges:List[Tuple[bytes, bytes]] :合并的规则，但是这样去tokenize的话也太慢了吧
-            看起来也是先转换为字节流，然后再进行合并，按照顺序进行排列
+    想清楚不同的层级
+    merge iterator id映射表示层
     """
-    #-----vocab initialization-----
-    vocab = {i: bytes([i]) for i in range(256)}
-    merges = []
+    def __init__(
+        self, 
+        vocab: dict[int, bytes], 
+        merges: list[tuple[bytes, bytes]], 
+        special_tokens: list[str] | None = None):
 
-    num_merges = vocab_size - 256 - len(special_tokens)
+        self.vocab = vocab
+        self.bytes_to_id = {v: k for k, v in vocab.items()}
 
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+      
+        self.gpt_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-    gpt2_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    @classmethod
+    def from_files(
+        cls, 
+        vocab_filepath: str, 
+        merges_filepath: str, 
+        special_tokens: list[str] | None = None):
+       
+        special_tokens = special_tokens or []
+        bytes_encoder = get_encoder_dict()#int -> str
+        bytes_decoder = {v: k for k, v in bytes_encoder.items()}
 
-    if special_tokens:
-        special_pat = "|".join(re.escape(t) for t in special_tokens)
-        full_pat = f"{special_pat}|{gpt2_pat}"
-    else:
-        full_pat = gpt2_pat
-    full_pat = re.compile(full_pat)
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            token_to_id = json.load(f)
+        vocab = {v: bytes([bytes_decoder[s] for s in k]) 
+            if k not in special_tokens else k.encode("utf-8") 
+            for k, v in token_to_id.items()}
 
-    raw_counts = Counter()#记录切分出来的word和数量的对应关系
-    bytes_list = []#存储bytes形式的word
-    bytes_counts = []#存储对应bytes形式的word的数量
-    bytes_pairs = defaultdict[tuple, int](int)#存储bytes pair及其对应的数量，这里是不是可以变成最大堆，始终把最大的数目放在上面，然后再拿走
-    bytes_pairs_indices = defaultdict(set)
-    for match in full_pat.finditer(text):
-        word = match.group()
-        raw_counts[word] += 1
+        merges = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                parts = line.split()
 
-    for word, count in raw_counts.items():
-        if word not in special_tokens:
-            bytes_from_word = [bytes([b]) for b in word.encode("utf-8")]
-            bytes_list.append(bytes_from_word)
-            bytes_counts.append(count)
-    for i, word in enumerate(bytes_list):
-        for j in range(len(word) - 1):
-            bytes_pairs[(word[j], word[j + 1])] += bytes_counts[i]
-            bytes_pairs_indices[(word[j], word[j + 1])].add(i)
+                p0 = bytes([bytes_decoder[s] for s in parts[0]])
+                p1 = bytes([bytes_decoder[s] for s in parts[1]])
 
-    for _ in range(num_merges):
-        if not bytes_pairs:
-            break
-        best_pair = max(bytes_pairs.item(), key=lambda x: (x[1], x[0]))[0]
-        if bytes_pairs[best_pair] <= 0:
-            break
-        merges.append(best_pair)
-        bytes_pairs[best_pair] = 0
+                merges.append((p0, p1))
+
+        return cls(vocab, merges, special_tokens)
+
+    def encode(
+        self, 
+        text: str) -> list[int]:
+    
+        if self.special_tokens:
+            sp_pat = "|".join(re.escape(t) for t in self.special_tokens)
+            full_pat = sp_pat + "|" + self.gpt_pat
+            full_pat = re.compile(full_pat)
+        else:
+            full_pat = re.compile(self.gpt_pat)
+
+        pieces = re.findall(full_pat, text)
+        #list[str] -> list[list[bytes]]
+        sp_token_utf8 = [t.encode("utf-8") for t in self.special_tokens]
+        words_list = []
+        for p in pieces:
+            p_bytes = p.encode("utf-8")
+            bytes_from_word = [p_bytes] if p_bytes in sp_token_utf8 else [bytes([p]) for p in p_bytes]
+            words_list.append(bytes_from_word)
+      
+        for merge in self.merges:
+            for i in range(len(words_list)):
+                cur = words_list[i]
+                if cur[0] in sp_token_utf8:
+                    words_list[i] = cur
+                    continue
+                new = []
+                l = len(cur)
+                j = 0
+                while j < l:
+                    if j < l - 1 and (cur[j], cur[j + 1]) == merge:
+                        new.append(cur[j] + cur[j + 1])
+                        j += 2
+                    else:
+                        new.append(cur[j])
+                        j += 1
+                words_list[i] = new
+     
+        res = []
+        for bytes_list in words_list:
+            for b in bytes_list:
+                res.append(self.bytes_to_id[b])
+        return res          
+
+    def encode_iterable(
+        self, 
+        iterable: Iterable[str]) -> Iterator[int]:
+       
+        if self.special_tokens:
+            sp_pat = "|".join(re.escape(t) for t in self.special_tokens)
+            full_pat = sp_pat + "|" + self.gpt_pat
+            full_pat = re.compile(full_pat)
+        else:
+            full_pat = re.compile(self.gpt_pat)
+        sp_token_utf8 = [t.encode("utf-8") for t in self.special_tokens]
+
+        token_ids = []
+
+        for text in iterable:
+            words = full_pat.finditer(text)
         
-        related_indices = bytes_pairs_indices[best_pair]
-        for i in range(len(related_indices)):
-            cur_word = bytes_list[i]
-            new_word = []
-            occur_list = []
-            for j in range(len(cur_word) - 1):
-                if cur_word[j] == best_pair[0] and cur_word[j + 1] == best_pair[1]:
-                    if j >= 1:#左边还有
-                        prev_pair = (cur_word[j - 1], cur_word[j])
-                        bytes_pairs[prev_pair] -= bytes_counts[i]
-                    if j + 2 <= len(cur_word) - 1:
-                        next_pair = (cur_word[j + 1], cur_word[j + 2])
-                        bytes_pairs[next_pair] -= bytes_counts[i]
+            for match in words:
+                word = match.group(
+                )
+                word_bytes = word.encode("utf-8")
+                if word_bytes in sp_token_utf8:
+                    yield self.bytes_to_id[word_bytes]
+                    continue
+                       
+                bytes_list = [bytes([b]) for b in word_bytes]
 
-            #前面减少，后面减少
-
+                for merge in self.merges:
+                    new = []
+                    l = len(bytes_list)
+                    j = 0
+                    while j < l:
+                        if j < l - 1 and (bytes_list[j], bytes_list[j + 1]) == merge:
+                            new.append(bytes_list[j] + bytes_list[j + 1])
+                            j += 2
+                        else:
+                            new.append(bytes_list[j])#这里存在可以优化的逻辑
+                            j += 1
+                    for b in bytes_list:
+                        yield self.bytes_to_id[b]
         
-    #---3.合并计算---
-    #我们现在要进行统计计算了，那么应该怎么做呢，
-    #遍历word count的每一个key value对，对每一个key遍历所有的bytes pair 然后进行加和
-    #然后记录这些数量然后求一个max，求完一个max之后找到那些有这
-   
 
-    #3. 进行计算 找到那个最多的？那我们要怎么知道，那个最多的在哪里呢，还是要再走一遍，
-    #       
 
-    #然后进行合并，遍历里面的每一个然后进行模式的收集但是可以找到那个最大的，但是要怎么进行合并呢
+    def decode(self, ids: list[int]) -> str:
+       
+        bytes_list = [self.vocab[id] for id in ids]
+        full_bytes = b''.join(bytes_list)
+        return full_bytes.decode("utf-8", errors="replace")
 
-    #我想检验一下，这个正则表达式会怎么进行划分
-    return NotImplementedError
